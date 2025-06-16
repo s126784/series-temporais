@@ -1,0 +1,1372 @@
+---
+title: "Tourist Time-Series Data Analysis"
+author: "Oleksandr Solovei (126784)"
+date: "2025-06-16"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+# Introduction
+
+The tourism industry is a vital component of the Portuguese economy, and forecasting tourist inflows is essential for effective planning and resource allocation. This project aims to analyze and forecast the monthly number of guests in Portugal's specialized accommodation sector using time series modeling techniques.
+
+The dataset, extracted from [official sources](https://www.ine.pt/xportal/xmain?xpid=INE&xpgid=ine_publicacoes&PUBLICACOESrevista=00&PUBLICACOEStema=5414335) and processed using R and Python.
+
+The methodology follows the Box & Jenkins approach for SARIMA models and includes:
+
+-   Data preprocessing and exploratory analysis
+-   Stationarity testing and transformation
+-   Model identification, estimation, and diagnostic checks
+-   Out-of-sample forecasting and evaluation of accuracy
+
+The SARIMA model is compared with ETS alternatives, and GARCH modeling is evaluated and ruled out based on statistical diagnostics. Forecast accuracy and interval reliability are assessed to determine the best-performing model. The final result includes both point forecasts and uncertainty quantification for future planning.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(forecast)
+library(tseries)
+library(urca)
+library(lmtest)
+library(FinTS)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(corrplot)
+library(scales)
+library(car)
+library(moments)
+library(seasonal)
+library(stats)
+library(utils)
+library(graphics)
+library(grDevices)
+```
+
+# Data Preparation
+
+First data was extracted from .XLSX using python-script and collected into the data foulder.
+
+```{r}
+df <- read.csv("data/portugal_tourism_ts_specialized.csv", stringsAsFactors = FALSE)
+df$Date <- as.Date(df$Date)
+summary(df)
+```
+
+Check for missing values
+
+```{r}
+missing_count <- sum(is.na(df$Guests))
+cat("Missing values:", missing_count, "\n")
+```
+
+## Data filtering
+
+```{r}
+complete_years <- c(2017:2023)
+df_complete <- df[format(df$Date, "%Y") %in% complete_years, ]
+```
+
+## Creating time-series object
+
+```{r}
+ts_data <- ts(df_complete$Guests, 
+              start = c(2017, 1), 
+              frequency = 12)
+
+cat("Time series created:\n")
+cat("Start:", paste(start(ts_data), collapse = "-"), "\n")
+cat("End:", paste(end(ts_data), collapse = "-"), "\n")
+cat("Frequency:", frequency(ts_data), "\n")
+cat("Length:", length(ts_data), "observations\n")
+```
+
+```{r}
+summary(ts_data)
+```
+
+```{r}
+cat("Standard deviation:", sd(ts_data), "\n")
+cat("Coefficient of variation:", sd(ts_data)/mean(ts_data)*100, "%\n")
+```
+
+## Split data to train and test sets
+
+```{r}
+# Training set: 2017-2021 (60 observations)
+ts_train <- window(ts_data, start = c(2017, 1), end = c(2021, 12))
+
+# Test set: 2022-2023 (24 observations)  
+ts_test <- window(ts_data, start = c(2022, 1), end = c(2023, 12))
+```
+
+## Data visualizations
+
+```{r, echo=FALSE}
+plot(ts_data, 
+     main = "Portuguese Tourism: Monthly Guest Arrivals (2017-2023)",
+     ylab = "Guests (thousands)", 
+     xlab = "Year",
+     col = "blue", 
+     lwd = 2)
+abline(v = 2022, col = "red", lty = 2, lwd = 2)
+legend("topleft", c("Training", "Test"), 
+       col = c("blue", "red"), lty = c(1, 2), lwd = 2)
+
+abline(v = 2020.25, col = "red", lty = 3, lwd = 1)
+text(2020.25, max(ts_train) * 0.9, "COVID-19", col = "red", cex = 0.8)
+dev.copy(png,filename="plots/monthly-guest-arrivals.png");
+dev.off ();
+```
+
+```{r}
+boxplot(ts_data ~ cycle(ts_data),
+        main = "Seasonal Patterns (All Years)",
+        xlab = "Month", 
+        ylab = "Guests (thousands)",
+        names = month.abb,
+        col = "lightblue")
+dev.copy(png,filename="plots/seasonal-patterns.png");
+dev.off ();
+
+```
+
+## COVID-19 Impact Analysis
+
+```{r}
+covid_2020 <- window(ts_data, start = c(2020, 1), end = c(2020, 12))
+pre_covid_2019 <- window(ts_data, start = c(2019, 1), end = c(2019, 12))
+recovery_2021 <- window(ts_data, start = c(2021, 1), end = c(2021, 12))
+
+min_idx <- which.min(ts_data)
+min_date <- time(ts_data)[min_idx]
+min_value <- min(ts_data)
+
+cat("Lowest point:", round(min_value, 1), "thousand guests in", 
+    paste(floor(min_date), round((min_date - floor(min_date)) * 12 + 1)), "\n")
+cat("2020 annual total:", round(sum(covid_2020), 1), "thousand\n")
+cat("2019 annual total:", round(sum(pre_covid_2019), 1), "thousand\n") 
+cat("2020 vs 2019:", round((sum(covid_2020)/sum(pre_covid_2019) - 1) * 100, 1), "% change\n")
+cat("2021 recovery:", round((sum(recovery_2021)/sum(pre_covid_2019) - 1) * 100, 1), "% vs 2019\n")
+```
+
+# Exploratory analysis
+
+```{r}
+par(mfrow = c(1, 3))
+
+# Original series with trend line
+plot(ts_train, 
+     main = "Training Set: Portuguese Tourism (2017-2021)",
+     ylab = "Monthly Guests (thousands)", 
+     xlab = "Year",
+     col = "steelblue", 
+     lwd = 2)
+trend_line <- lm(as.numeric(ts_train) ~ time(ts_train))
+abline(trend_line, col = "red", lwd = 2, lty = 2)
+legend("topright", c("Data", "Trend"), col = c("steelblue", "red"), 
+       lty = c(1, 2), lwd = 2)
+
+# Autocorrelation function
+acf(ts_train, 
+    main = "Autocorrelation Function (Training Set)",
+    lag.max = 36)
+
+# Seasonal boxplot
+boxplot(ts_train ~ cycle(ts_train),
+        main = "Seasonal Distribution",
+        xlab = "Month",
+        ylab = "Guests (thousands)", 
+        names = month.abb,
+        col = rainbow(12))
+
+dev.copy(png,filename="plots/exploratory-analysis.png");
+dev.off ();
+```
+
+## Time-series decomposition
+
+```{r}
+decomp_classical <- decompose(ts_train, type = "multiplicative")
+decomp_stl <- stl(ts_train, s.window = "periodic")
+
+par(mfrow = c(2, 1))
+
+# Classical decomposition
+plot(decomp_classical)
+
+dev.copy(png,filename="plots/decomposition-classic.png");
+dev.off ();
+
+# STL decomposition  
+plot(decomp_stl)
+
+dev.copy(png,filename="plots/decomposition-stl.png");
+dev.off ();
+```
+
+```{r}
+test_stationarity <- function(x, name) {
+  cat("Testing:", name, "\n")
+  
+  # ADF test
+  adf_result <- adf.test(x, alternative = "stationary")
+  cat("ADF test p-value:", round(adf_result$p.value, 4), "\n")
+  
+  # KPSS test
+  kpss_result <- kpss.test(x, null = "Level")
+  cat("KPSS test p-value:", round(kpss_result$p.value, 4), "\n")
+  
+  # Phillips-Perron test
+  pp_result <- pp.test(x, alternative = "stationary")
+  cat("PP test p-value:", round(pp_result$p.value, 4), "\n")
+  
+  cat("Interpretation:")
+  if(adf_result$p.value < 0.05 && kpss_result$p.value > 0.05) {
+    cat(" STATIONARY\n")
+  } else if(adf_result$p.value >= 0.05 && kpss_result$p.value <= 0.05) {
+    cat(" NON-STATIONARY\n") 
+  } else {
+    cat(" INCONCLUSIVE\n")
+  }
+  cat("\n")
+}
+
+# Test original series
+test_stationarity(ts_train, "Original series")
+
+# Test first differences
+diff1 <- diff(ts_train)
+test_stationarity(diff1, "First differences")
+
+# Test seasonal differences  
+diff12 <- diff(ts_train, lag = 12)
+test_stationarity(diff12, "Seasonal differences (lag=12)")
+
+# Test both differences
+diff1_12 <- diff(diff(ts_train, lag = 12))
+test_stationarity(diff1_12, "First + Seasonal differences")
+```
+
+## Transformations
+
+```{r}
+
+lambda <- BoxCox.lambda(ts_train)
+cat("Optimal Box-Cox lambda:", round(lambda, 3), "\n")
+
+# Test if transformation is needed
+if(abs(lambda - 1) < 0.1) {
+  cat("Recommendation: No transformation needed (lambda ≈ 1)\n")
+  ts_transformed <- ts_train
+  transform_used <- "none"
+}
+```
+
+## Differencing analysis
+
+```{r}
+ndiffs_reg <- ndiffs(ts_train, test = "adf")
+ndiffs_seas <- nsdiffs(ts_train, test = "seas")
+
+cat("Regular differences (d):", ndiffs_reg, "\n")
+cat("Seasonal differences (D):", ndiffs_seas, "\n")
+
+if(ndiffs_seas > 0) {
+  ts_diff_seas <- diff(ts_train, lag = 12, differences = ndiffs_seas)
+} else {
+  ts_diff_seas <- ts_train
+}
+
+if(ndiffs_reg > 0) {
+  ts_diff_final <- diff(ts_diff_seas, differences = ndiffs_reg)
+} else {
+  ts_diff_final <- ts_diff_seas
+}
+
+par(mfrow = c(3, 2))
+
+# Original series
+plot(ts_train, main = "Original Series", ylab = "Guests", col = "blue", lwd = 2)
+acf(ts_train, main = "ACF: Original", lag.max = 36)
+
+# After seasonal differencing
+if(ndiffs_seas > 0) {
+  plot(ts_diff_seas, main = "After Seasonal Differencing", ylab = "Diff", col = "green", lwd = 2)
+  acf(ts_diff_seas, main = "ACF: Seasonal Diff", lag.max = 36)
+} else {
+  plot.new()
+  plot.new()
+}
+
+plot(ts_diff_final, main = "Final Differenced Series", ylab = "Diff", col = "red", lwd = 2) 
+acf(ts_diff_final, main = "ACF: Final Diff", lag.max = 36)
+
+dev.copy(png,filename="plots/dif-analysis.png");
+dev.off ();
+
+```
+
+# Model Identification
+
+```{r}
+par(mfrow = c(2, 2))
+
+# ACF and PACF of final differenced series
+acf(ts_diff_final, 
+    main = "ACF: Differenced Series", 
+    lag.max = 36)
+
+pacf(ts_diff_final,
+     main = "PACF: Differenced Series",
+     lag.max = 36)
+
+# Seasonal analysis
+acf(ts_diff_final,
+    main = "ACF: Focus on Seasonal Lags",
+    lag.max = 24)
+
+pacf(ts_diff_final, 
+     main = "PACF: Focus on Seasonal Lags",
+     lag.max = 24)
+
+dev.copy(png,filename="plots/model-identification.png");
+dev.off ();
+```
+
+Suggest initial SARIM parameter based on differencing tests
+
+```{r}
+# Analyze ACF/PACF patterns for p, q, P, Q
+acf_values <- acf(ts_diff_final, plot = FALSE, lag.max = 24)$acf
+pacf_values <- pacf(ts_diff_final, plot = FALSE, lag.max = 24)$acf
+
+# Check for significant lags
+significant_acf <- which(abs(acf_values[-1]) > 1.96/sqrt(length(ts_diff_final)))
+significant_pacf <- which(abs(pacf_values) > 1.96/sqrt(length(ts_diff_final)))
+
+cat("Significant ACF lags:", if(length(significant_acf) > 0) significant_acf else "None", "\n")
+cat("Significant PACF lags:", if(length(significant_pacf) > 0) significant_pacf else "None", "\n")
+```
+
+```{r}
+analysis_results <- list(
+  lambda = lambda,
+  transform_used = transform_used,
+  ts_transformed = ts_transformed,
+  ndiffs_regular = ndiffs_reg,
+  ndiffs_seasonal = ndiffs_seas,
+  ts_differenced = ts_diff_final,
+  decomposition = decomp_stl,
+  significant_acf_lags = significant_acf,
+  significant_pacf_lags = significant_pacf
+)
+```
+
+## SARIMA identification
+
+```{r}
+max_p <- 3
+max_q <- 3
+max_P <- 2  
+max_Q <- 2
+
+# Use EDA-suggested differencing
+d <- analysis_results$ndiffs_regular
+D <- analysis_results$ndiffs_seasonal
+
+cat("Parameter search space:\n")
+cat("p: 0 to", max_p, "\n")
+cat("d:", d, "(fixed from EDA)\n") 
+cat("q: 0 to", max_q, "\n")
+cat("P: 0 to", max_P, "\n")
+cat("D:", D, "(fixed from EDA)\n")
+cat("Q: 0 to", max_Q, "\n")
+cat("Seasonal period: 12\n\n")
+
+# Initialize results storage
+model_results <- data.frame()
+model_counter <- 0
+
+cat("Fitting models...\n")
+
+# Grid search through parameter combinations
+for(p in 0:max_p) {
+  for(q in 0:max_q) {
+    for(P in 0:max_P) {
+      for(Q in 0:max_Q) {
+        
+        # Skip models with too many parameters
+        if((p + q + P + Q) > 6) next
+        
+        # Skip some redundant models
+        if(p == 0 && q == 0 && P == 0 && Q == 0) next
+        
+        model_counter <- model_counter + 1
+        model_name <- paste0("SARIMA(", p, ",", d, ",", q, ")(", P, ",", D, ",", Q, ")[12]")
+        
+        if(model_counter %% 10 == 0) {
+          cat("Fitted", model_counter, "models...\n")
+        }
+        
+        # Try fitting the model
+        tryCatch({
+          
+          fit <- Arima(ts_train, 
+                       order = c(p, d, q),
+                       seasonal = list(order = c(P, D, Q), period = 12),
+                       method = "ML",
+                       optim.control = list(maxit = 1000))
+          
+          aic_val <- fit$aic
+          bic_val <- BIC(fit)
+          aicc_val <- fit$aicc
+          
+          residuals_model <- residuals(fit)
+          ljung_box <- Box.test(residuals_model, lag = 20, type = "Ljung-Box")
+          
+          n_params <- length(fit$coef)
+          
+          model_results <- rbind(model_results, data.frame(
+            model = model_name,
+            p = p, d = d, q = q, P = P, D = D, Q = Q,
+            aic = aic_val,
+            bic = bic_val, 
+            aicc = aicc_val,
+            n_params = n_params,
+            ljung_box_pvalue = ljung_box$p.value,
+            loglik = fit$loglik,
+            stringsAsFactors = FALSE
+          ))
+          
+        }, error = function(e) {
+          # Model failed to converge - skip
+          NULL
+        })
+      }
+    }
+  }
+}
+
+cat("Completed fitting", nrow(model_results), "successful models\n\n")
+```
+
+### Model Ranking
+
+```{r}
+
+# Sort by different criteria
+models_by_aic <- model_results[order(model_results$aic), ]
+models_by_bic <- model_results[order(model_results$bic), ]
+models_by_aicc <- model_results[order(model_results$aicc), ]
+
+# Top models by each criterion
+cat("Top 5 models by AIC:\n")
+print(models_by_aic[1:5, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")])
+
+cat("\n   Top 5 models by BIC:\n") 
+print(models_by_bic[1:5, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")])
+
+cat("\n   Top 5 models by AICc:\n")
+print(models_by_aicc[1:5, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")])
+
+# Identify models that pass Ljung-Box test (p > 0.05)
+good_residuals <- model_results[model_results$ljung_box_pvalue > 0.05, ]
+
+if(nrow(good_residuals) > 0) {
+  cat("\n   Models with good residuals (Ljung-Box p > 0.05):\n")
+  good_residuals_sorted <- good_residuals[order(good_residuals$aicc), ]
+  print(head(good_residuals_sorted[, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")], 10))
+} else {
+  cat("\n   ⚠️  No models pass Ljung-Box test at α = 0.05\n")
+  cat(" Considering models with p > 0.01...\n")
+  marginal_residuals <- model_results[model_results$ljung_box_pvalue > 0.01, ]
+  if(nrow(marginal_residuals) > 0) {
+    marginal_sorted <- marginal_residuals[order(marginal_residuals$aicc), ]
+    print(head(marginal_sorted[, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")], 5))
+  }
+}
+
+```
+
+```{r}
+select_top_models <- function(df, n = 3) {
+  unique_models <- df[!duplicated(df$model), ]
+  head(unique_models, n)
+}
+
+# Combine top models from different criteria
+top_aic <- select_top_models(models_by_aic, 2)
+top_bic <- select_top_models(models_by_bic, 2) 
+top_aicc <- select_top_models(models_by_aicc, 2)
+
+# Remove duplicates
+candidate_models <- unique(rbind(top_aic, top_bic, top_aicc))
+
+# Add best models with good residuals if available
+if(nrow(good_residuals) > 0) {
+  top_residuals <- select_top_models(good_residuals_sorted, 2)
+  candidate_models <- unique(rbind(candidate_models, top_residuals))
+}
+
+# Sort by AICc for final selection
+candidate_models <- candidate_models[order(candidate_models$aicc), ]
+
+print(candidate_models[, c("model", "aic", "bic", "aicc", "ljung_box_pvalue")])
+
+```
+
+### Auto.arima selection
+
+```{r}
+auto_models <- list()
+
+# Standard auto.arima
+auto_models$standard <- auto.arima(ts_train, 
+                                  seasonal = TRUE,
+                                  stepwise = FALSE,
+                                  approximation = FALSE)
+
+# Auto.arima with more extensive search
+auto_models$extensive <- auto.arima(ts_train,
+                                   max.p = 3, max.q = 3,
+                                   max.P = 2, max.Q = 2,
+                                   seasonal = TRUE,
+                                   stepwise = FALSE,
+                                   approximation = FALSE)
+
+# Print auto.arima results
+cat("Auto.arima results:\n")
+for(name in names(auto_models)) {
+  model <- auto_models[[name]]
+  ljung_auto <- Box.test(residuals(model), lag = 20, type = "Ljung-Box")
+  
+  cat("", name, ":", 
+      paste0("SARIMA(", paste(arimaorder(model)[1:3], collapse = ","), ")",
+             "(", paste(arimaorder(model)[4:6], collapse = ","), ")[12]"),
+      "\n")
+  cat(" AIC:", round(model$aic, 2), 
+      "BIC:", round(BIC(model), 2),
+      "AICc:", round(model$aicc, 2),
+      "Ljung-Box p:", round(ljung_auto$p.value, 4), "\n")
+}
+```
+
+```{r}
+par(mfrow = c(2, 2))
+
+# AIC vs BIC scatter
+plot(model_results$aic, model_results$bic,
+     xlab = "AIC", ylab = "BIC",
+     main = "Model Comparison: AIC vs BIC",
+     pch = 16, col = "steelblue")
+
+# Highlight candidates
+points(candidate_models$aic, candidate_models$bic, 
+       pch = 16, col = "red", cex = 1.5)
+
+#  Model complexity vs fit
+plot(model_results$n_params, model_results$aicc,
+     xlab = "Number of Parameters", ylab = "AICc", 
+     main = "Model Complexity vs Fit",
+     pch = 16, col = "steelblue")
+points(candidate_models$n_params, candidate_models$aicc,
+       pch = 16, col = "red", cex = 1.5)
+
+#  Ljung-Box p-values
+hist(model_results$ljung_box_pvalue,
+     breaks = 20,
+     main = "Distribution of Ljung-Box p-values",
+     xlab = "p-value",
+     col = "lightblue",
+     border = "darkblue")
+abline(v = 0.05, col = "red", lwd = 2, lty = 2)
+
+#  Top models comparison
+n_top <- min(10, nrow(candidate_models))
+barplot(candidate_models$aicc[1:n_top],
+        names.arg = substr(candidate_models$model[1:n_top], 7, 20),
+        main = "Top Candidate Models (AICc)",
+        ylab = "AICc",
+        las = 2,
+        col = rainbow(n_top))
+
+dev.copy(png,filename="plots/model-charts.png");
+dev.off ();
+```
+
+```{r}
+identification_results <- list(
+  all_models = model_results,
+  candidate_models = candidate_models,
+  auto_arima_models = auto_models,
+  search_parameters = list(
+    max_p = max_p, d = d, max_q = max_q,
+    max_P = max_P, D = D, max_Q = max_Q
+  )
+)
+
+# Save top models summary to CSV
+write.csv(candidate_models, "analysis/candidate_models.csv", row.names = FALSE)
+```
+
+## Detailed model estimation
+
+```{r}
+analyze_sarima_model <- function(p, d, q, P, D, Q, data, model_name) {
+  
+  cat("\n   Analyzing", model_name, "...\n")
+  
+  # Fit the model
+  fit <- Arima(data, 
+               order = c(p, d, q),
+               seasonal = list(order = c(P, D, Q), period = 12),
+               method = "ML")
+  
+  # Model summary
+  cat("Model fitted successfully\n")
+  cat("Log-likelihood:", fit$loglik, "\n")
+  cat("AIC:", fit$aic, "BIC:", BIC(fit), "AICc:", fit$aicc, "\n")
+  
+  coef_summary <- data.frame(
+    Parameter = names(fit$coef),
+    Estimate = as.numeric(fit$coef),
+    Std_Error = sqrt(diag(fit$var.coef)),
+    stringsAsFactors = FALSE
+  )
+  
+  coef_summary$t_value <- coef_summary$Estimate / coef_summary$Std_Error
+  coef_summary$p_value <- 2 * (1 - pnorm(abs(coef_summary$t_value)))
+  coef_summary$Significant <- coef_summary$p_value < 0.05
+  
+  cat("Parameter significance:\n")
+  print(coef_summary)
+  
+  # Parameter correlation matrix
+  if(length(fit$coef) > 1) {
+    param_corr <- cov2cor(fit$var.coef)
+    cat("Parameter correlation matrix:\n")
+    print(round(param_corr, 3))
+    
+    # Check for high correlations
+    high_corr <- which(abs(param_corr) > 0.7 & param_corr != 1, arr.ind = TRUE)
+    if(nrow(high_corr) > 0) {
+      cat("⚠️  High parameter correlations detected (>0.7)\n")
+    }
+  }
+  
+  # Residual diagnostics
+  residuals_model <- residuals(fit)
+  
+  # Ljung-Box test (multiple lags)
+  ljung_tests <- sapply(c(10, 15, 20), function(lag) {
+    test_result <- Box.test(residuals_model, lag = lag, type = "Ljung-Box")
+    return(test_result$p.value)
+  })
+  names(ljung_tests) <- paste0("LB_", c(10, 15, 20))
+  
+  cat("Ljung-Box tests (p-values):\n")
+  for(i in 1:length(ljung_tests)) {
+    cat("  Lag", gsub("LB_", "", names(ljung_tests)[i]), ":", round(ljung_tests[i], 4), "\n")
+  }
+  
+  # Normality tests
+  shapiro_test <- shapiro.test(residuals_model)
+  jarque_test <- jarque.bera.test(residuals_model)
+  
+  cat("Normality tests:\n")
+  cat("  Shapiro-Wilk p-value:", round(shapiro_test$p.value, 4), "\n")
+  cat("  Jarque-Bera p-value:", round(jarque_test$p.value, 4), "\n")
+  
+  # ARCH effects test
+  arch_test <- ArchTest(residuals_model, lags = 12)
+  cat("ARCH test p-value:", round(arch_test$p.value, 4), "\n")
+  
+  # Compile diagnostics
+  diagnostics <- list(
+    model = fit,
+    model_name = model_name,
+    parameters = coef_summary,
+    parameter_correlation = if(length(fit$coef) > 1) param_corr else NULL,
+    ljung_box_tests = ljung_tests,
+    shapiro_test = shapiro_test$p.value,
+    jarque_test = jarque_test$p.value,
+    arch_test = arch_test$p.value,
+    residuals = residuals_model,
+    fitted_values = fitted(fit)
+  )
+  
+  return(diagnostics)
+}
+
+# Analyze all candidate models
+detailed_results <- list()
+
+for(i in 1:nrow(identification_results$candidate_models)) {
+  row <- identification_results$candidate_models[i, ]
+  
+  detailed_results[[i]] <- analyze_sarima_model(
+    p = row$p, d = row$d, q = row$q,
+    P = row$P, D = row$D, Q = row$Q,
+    data = ts_train,
+    model_name = row$model
+  )
+}
+```
+
+## Model Comparision and Selection
+
+```{r}
+comparison_table <- data.frame()
+
+for(i in 1:length(detailed_results)) {
+  result <- detailed_results[[i]]
+  
+  # Count significant parameters
+  sig_params <- sum(result$parameters$Significant)
+  total_params <- nrow(result$parameters)
+  
+  # Best Ljung-Box p-value
+  best_ljung <- max(result$ljung_box_tests)
+  
+  # Parameter issues
+  param_issues <- 0
+  if(!is.null(result$parameter_correlation)) {
+    high_corr <- sum(abs(result$parameter_correlation) > 0.7 & result$parameter_correlation != 1) / 2
+    param_issues <- param_issues + high_corr
+  }
+  param_issues <- param_issues + (total_params - sig_params)  # Add non-significant params
+  
+  comparison_table <- rbind(comparison_table, data.frame(
+    Model = result$model_name,
+    AIC = result$model$aic,
+    BIC = BIC(result$model),
+    AICc = result$model$aicc,
+    LogLik = result$model$loglik,
+    Sig_Params = paste0(sig_params, "/", total_params),
+    Best_LjungBox = best_ljung,
+    Shapiro_p = result$shapiro_test,
+    ARCH_p = result$arch_test,
+    Param_Issues = param_issues,
+    stringsAsFactors = FALSE
+  ))
+}
+
+cat("Model comparison table:\n")
+print(comparison_table)
+
+# Model selection scoring
+comparison_table$Score <- 0
+
+# Scoring criteria (lower is better)
+comparison_table$Score <- comparison_table$Score + rank(comparison_table$AICc)  # AICc rank
+comparison_table$Score <- comparison_table$Score + ifelse(comparison_table$Best_LjungBox > 0.05, 0, 10)  # Ljung-Box penalty
+comparison_table$Score <- comparison_table$Score + ifelse(comparison_table$Shapiro_p > 0.05, 0, 5)  # Normality penalty  
+comparison_table$Score <- comparison_table$Score + comparison_table$Param_Issues * 3  # Parameter issues penalty
+
+# Select best model
+best_model_idx <- which.min(comparison_table$Score)
+best_model <- detailed_results[[best_model_idx]]
+
+cat("\n   Selected best model:", best_model$model_name, "\n")
+cat("Selection score:", comparison_table$Score[best_model_idx], "(lower is better)\n")
+```
+
+## Detailed diagnostic of the best model
+
+```{r}
+par(mfrow = c(2, 2))
+
+# Residuals vs time
+plot(best_model$residuals, 
+     main = paste("Residuals:", best_model$model_name),
+     ylab = "Residuals", 
+     type = "l",
+     col = "blue")
+abline(h = 0, col = "red", lty = 2)
+
+# Q-Q plot
+qqnorm(best_model$residuals, main = "Q-Q Plot: Residuals")
+qqline(best_model$residuals, col = "red", lwd = 2)
+
+# ACF of residuals
+acf(best_model$residuals, main = "ACF: Residuals", lag.max = 24)
+
+# Original vs fitted
+plot(ts_train, 
+     main = "Original vs Fitted Values",
+     ylab = "Guests (thousands)",
+     col = "blue", 
+     lwd = 2)
+lines(fitted(best_model$model), col = "red", lwd = 2)
+legend("topleft", c("Original", "Fitted"), col = c("blue", "red"), lwd = 2)
+
+dev.copy(png,filename="plots/residuals.png");
+dev.off ();
+
+```
+
+## Parameter correlation matrix
+
+```{r}
+if(!is.null(best_model$parameter_correlation) && nrow(best_model$parameter_correlation) > 1) {
+  corrplot(best_model$parameter_correlation, 
+           method = "color",
+           type = "upper",
+           order = "hclust",
+           tl.cex = 0.8,
+           title = paste("Parameter Correlation:", best_model$model_name))
+}
+```
+
+## Residual analysis
+
+```{r}
+residuals_best <- best_model$residuals
+
+# Detailed residual statistics
+cat("Residual statistics:\n")
+cat("Mean:", mean(residuals_best), "\n")
+cat("Std Dev:", sd(residuals_best), "\n")
+cat("Skewness:", moments::skewness(residuals_best), "\n")
+cat("Kurtosis:", moments::kurtosis(residuals_best), "\n")
+
+# Outlier detection
+outlier_threshold <- 3 * sd(residuals_best)
+outliers <- which(abs(residuals_best) > outlier_threshold)
+cat("Outliers (>3σ):", length(outliers), "\n")
+if(length(outliers) > 0) {
+  outlier_dates <- time(ts_train)[outliers]
+  cat("Outlier dates:", paste(outlier_dates, collapse = ", "), "\n")
+}
+```
+
+```{r}
+estimation_results <- list(
+  all_detailed_results = detailed_results,
+  comparison_table = comparison_table,
+  best_model = best_model,
+  best_model_index = best_model_idx
+)
+```
+
+# Model validation
+
+## Minimal model comparision
+
+### ARCH Effects Test
+
+```{r}
+
+cat("Testing for ARCH effects (GARCH necessity)...\n")
+arch_test_result <- ArchTest(best_model$residuals, lags = 12)
+cat("ARCH test statistic:", round(arch_test_result$statistic, 4), "\n")
+cat("ARCH test p-value:", round(arch_test_result$p.value, 4), "\n")
+
+if(arch_test_result$p.value > 0.05) {
+  cat("✅ No ARCH effects detected - GARCH modeling not needed\n")
+  garch_needed <- FALSE
+} else {
+  cat("⚠️  ARCH effects detected - GARCH modeling might be beneficial\n")
+  garch_needed <- TRUE
+}
+
+```
+
+### Simple ETS Comparison
+
+```{r}
+tryCatch({
+  ets_model <- ets(ts_train, model = "ZZZ", ic = "aicc")
+  ets_residuals <- residuals(ets_model)
+  
+  # ETS diagnostics
+  ets_ljung <- Box.test(ets_residuals, lag = 20, type = "Ljung-Box")
+  
+  cat("ETS model selected:", ets_model$method, "\n")
+  cat("ETS AICc:", round(ets_model$aicc, 2), "\n")
+  cat("ETS Ljung-Box p-value:", round(ets_ljung$p.value, 4), "\n")
+  
+  # Compare with SARIMA
+  cat("\n   Model comparison:\n")
+  cat("SARIMA AICc:", round(best_model$model$aicc, 2), "\n")
+  cat("ETS AICc:", round(ets_model$aicc, 2), "\n")
+  
+  if(best_model$model$aicc < ets_model$aicc) {
+    cat("✅ SARIMA preferred (lower AICc)\n")
+    sarima_preferred <- TRUE
+  } else {
+    cat("⚠️  ETS has lower AICc\n")
+    sarima_preferred <- FALSE
+  }
+  
+  ets_comparison <- list(
+    model = ets_model,
+    ljung_box_p = ets_ljung$p.value,
+    preferred = sarima_preferred
+  )
+  
+}, error = function(e) {
+  cat("❌ ETS model fitting failed:", e$message, "\n")
+  ets_comparison <- NULL
+})
+```
+
+### Out-of-sample forecasting validation
+
+```{r}
+# Generate forecasts for test period
+forecast_horizon <- length(ts_test)
+cat("Generating", forecast_horizon, "step-ahead forecasts...\n")
+
+# SARIMA forecasts
+sarima_forecast <- forecast(best_model$model, h = forecast_horizon)
+
+# ETS forecasts (if available)
+if(!is.null(ets_comparison)) {
+  ets_forecast <- forecast(ets_comparison$model, h = forecast_horizon)
+} else {
+  ets_forecast <- NULL
+}
+
+# Extract forecast components
+sarima_point_forecasts <- as.numeric(sarima_forecast$mean)
+sarima_lower80 <- as.numeric(sarima_forecast$lower[, 1])
+sarima_upper80 <- as.numeric(sarima_forecast$upper[, 1])
+sarima_lower95 <- as.numeric(sarima_forecast$lower[, 2])
+sarima_upper95 <- as.numeric(sarima_forecast$upper[, 2])
+
+# Calculate accuracy metrics for SARIMA
+sarima_accuracy <- accuracy(sarima_forecast, ts_test)
+
+cat("SARIMA forecast accuracy:\n")
+print(sarima_accuracy)
+
+# Individual error components
+sarima_errors <- as.numeric(ts_test) - sarima_point_forecasts
+sarima_abs_errors <- abs(sarima_errors)
+sarima_squared_errors <- sarima_errors^2
+
+# Additional metrics
+cat("\n   Additional SARIMA metrics:\n")
+cat("Mean Error (ME):", round(mean(sarima_errors), 3), "\n")
+cat("Mean Absolute Error (MAE):", round(mean(sarima_abs_errors), 3), "\n")
+cat("Root Mean Squared Error (RMSE):", round(sqrt(mean(sarima_squared_errors)), 3), "\n")
+cat("Mean Absolute Percentage Error (MAPE):", round(mean(abs(sarima_errors/as.numeric(ts_test)) * 100), 3), "%\n")
+
+# Directional accuracy
+direction_actual <- diff(as.numeric(ts_test))
+direction_forecast <- diff(sarima_point_forecasts)
+directional_accuracy <- mean(sign(direction_actual) == sign(direction_forecast)) * 100
+cat("Directional Accuracy:", round(directional_accuracy, 1), "%\n")
+
+# ETS comparison (if available)
+if(!is.null(ets_forecast)) {
+  ets_accuracy <- accuracy(ets_forecast, ts_test)
+  cat("\n   ETS forecast accuracy:\n")
+  print(ets_accuracy)
+  
+  # Compare key metrics
+  cat("\n   Model comparison (Test Set RMSE):\n")
+  cat("SARIMA RMSE:", round(sarima_accuracy[2, "RMSE"], 3), "\n")
+  cat("ETS RMSE:", round(ets_accuracy[2, "RMSE"], 3), "\n")
+  
+  if(sarima_accuracy[2, "RMSE"] < ets_accuracy[2, "RMSE"]) {
+    cat("✅ SARIMA has better forecast accuracy\n")
+  } else {
+    cat("⚠️  ETS has better forecast accuracy\n")
+  }
+}
+```
+
+## Confidence Interval Analysis
+
+### Coverage analysis
+
+```{r}
+coverage_80 <- mean(as.numeric(ts_test) >= sarima_lower80 & as.numeric(ts_test) <= sarima_upper80) * 100
+coverage_95 <- mean(as.numeric(ts_test) >= sarima_lower95 & as.numeric(ts_test) <= sarima_upper95) * 100
+
+cat("Confidence interval coverage:\n")
+cat("80% interval coverage:", round(coverage_80, 1), "% (target: 80%)\n")
+cat("95% interval coverage:", round(coverage_95, 1), "% (target: 95%)\n")
+
+# Interval width analysis
+width_80 <- mean(sarima_upper80 - sarima_lower80)
+width_95 <- mean(sarima_upper95 - sarima_lower95)
+
+cat("Average interval widths:\n")
+cat("80% interval width:", round(width_80, 2), "thousand guests\n")
+cat("95% interval width:", round(width_95, 2), "thousand guests\n")
+```
+
+## Forecast visualizations
+
+```{r}
+par(mfrow = c(2, 2))
+
+# Full forecast comparison
+plot(ts_data, 
+     main = "SARIMA Forecast vs Actual (Full Series)",
+     ylab = "Guests (thousands)",
+     col = "blue", 
+     lwd = 2)
+lines(sarima_forecast$mean, col = "red", lwd = 2)
+lines(sarima_forecast$lower[,2], col = "red", lty = 2)
+lines(sarima_forecast$upper[,2], col = "red", lty = 2)
+abline(v = end(ts_train)[1] + end(ts_train)[2]/12, col = "gray", lty = 3, lwd = 2)
+legend("topleft", c("Actual", "SARIMA Forecast", "95% CI"), 
+       col = c("blue", "red", "red"), lty = c(1, 1, 2), lwd = c(2, 2, 1))
+
+# Test period detail
+plot(ts_test,
+     main = "Test Period: Forecast vs Actual", 
+     ylab = "Guests (thousands)",
+     col = "blue",
+     lwd = 3,
+     ylim = range(c(ts_test, sarima_lower95, sarima_upper95)))
+lines(sarima_forecast$mean, col = "red", lwd = 2)
+lines(sarima_forecast$lower[,1], col = "orange", lty = 2)
+lines(sarima_forecast$upper[,1], col = "orange", lty = 2)
+lines(sarima_forecast$lower[,2], col = "red", lty = 2)
+lines(sarima_forecast$upper[,2], col = "red", lty = 2)
+legend("topleft", c("Actual", "Forecast", "80% CI", "95% CI"),
+       col = c("blue", "red", "orange", "red"), lty = c(1, 1, 2, 2), lwd = c(3, 2, 1, 1))
+
+# Forecast errors
+plot(sarima_errors,
+     main = "Forecast Errors",
+     ylab = "Error (Actual - Forecast)", 
+     type = "b",
+     col = "purple",
+     pch = 16)
+abline(h = 0, col = "red", lty = 2)
+abline(h = c(-2*sd(sarima_errors), 2*sd(sarima_errors)), col = "orange", lty = 3)
+
+dev.copy(png,filename="plots/forecast-vs-actual.png");
+dev.off ();
+```
+
+```{r}
+
+# Compile validation results
+validation_results <- list(
+  sarima_model = best_model$model,
+  sarima_forecast = sarima_forecast,
+  sarima_accuracy = sarima_accuracy,
+  ets_comparison = ets_comparison,
+  ets_forecast = ets_forecast,
+  arch_test = list(
+    statistic = arch_test_result$statistic,
+    p_value = arch_test_result$p.value,
+    garch_needed = garch_needed
+  ),
+  coverage_analysis = list(
+    coverage_80 = coverage_80,
+    coverage_95 = coverage_95,
+    width_80 = width_80, 
+    width_95 = width_95
+  ),
+  forecast_errors = sarima_errors,
+  directional_accuracy = directional_accuracy
+)
+
+# Save forecast results to CSV
+forecast_results_df <- data.frame(
+  Date = as.character(time(ts_test)),
+  Actual = as.numeric(ts_test),
+  Forecast = sarima_point_forecasts,
+  Error = sarima_errors,
+  Lower_80 = sarima_lower80,
+  Upper_80 = sarima_upper80,
+  Lower_95 = sarima_lower95,
+  Upper_95 = sarima_upper95
+)
+
+write.csv(forecast_results_df, "analysis/forecast_results.csv", row.names = FALSE)
+```
+
+# Forecasting
+
+```{r}
+final_model <- validation_results$sarima_model
+model_name <- estimation_results$best_model$model_name
+
+# Extract model parameters
+model_order <- arimaorder(final_model)
+p <- model_order[1]; d <- model_order[2]; q <- model_order[3]
+P <- model_order[4]; D <- model_order[5]; Q <- model_order[6]
+
+# refit on complete data for final forecasting
+final_fit <- Arima(ts_data,
+                   order = c(p, d, q),
+                   seasonal = list(order = c(P, D, Q), period = 12),
+                   method = "ML")
+
+cat("Complete dataset model statistics:\n")
+cat("Log-likelihood:", round(final_fit$loglik, 2), "\n")
+cat("AIC:", round(final_fit$aic, 2), "\n")
+cat("BIC:", round(BIC(final_fit), 2), "\n")
+cat("AICc:", round(final_fit$aicc, 2), "\n")
+
+# Check final model residuals
+final_residuals <- residuals(final_fit)
+ljung_final <- Box.test(final_residuals, lag = 20, type = "Ljung-Box")
+cat("Final Ljung-Box p-value:", round(ljung_final$p.value, 4), "\n")
+```
+
+## Generate future forecasts
+
+```{r}
+# Forecast horizons
+h_short <- 12  # 1 year ahead
+h_medium <- 24  # 2 years ahead
+h_long <- 36 # 3 years ahead
+
+forecast_12m <- forecast(final_fit, h = h_short)
+forecast_24m <- forecast(final_fit, h = h_medium)
+forecast_36m <- forecast(final_fit, h = h_long)
+
+forecast_36m
+```
+
+## Forecast analysis
+
+```{r}
+forecast_2024 <- as.numeric(forecast_12m$mean)
+lower_80_2024 <- as.numeric(forecast_12m$lower[, 1])
+upper_80_2024 <- as.numeric(forecast_12m$upper[, 1])
+lower_95_2024 <- as.numeric(forecast_12m$lower[, 2])
+upper_95_2024 <- as.numeric(forecast_12m$upper[, 2])
+
+cat("2024 forecast summary:\n")
+cat("Annual total forecast:", round(sum(forecast_2024), 0), "thousand guests\n")
+cat("Peak month forecast:", round(max(forecast_2024), 0), "thousand guests\n")
+cat("Low month forecast:", round(min(forecast_2024), 0), "thousand guests\n")
+cat("Seasonal ratio:", round(max(forecast_2024)/min(forecast_2024), 2), "\n")
+
+# Compare with historical averages  
+historical_2019 <- window(ts_data, start = c(2019, 1), end = c(2019, 12))
+historical_2023 <- window(ts_data, start = c(2023, 1), end = c(2023, 12))
+
+cat("Comparison with historical years:\n")
+cat("2024 forecast vs 2019:", round((sum(forecast_2024)/sum(historical_2019) - 1) * 100, 1), "% change\n")
+cat("2024 forecast vs 2023:", round((sum(forecast_2024)/sum(historical_2023) - 1) * 100, 1), "% change\n")
+```
+
+### Seasonal pattern analysis
+
+```{r}
+monthly_names <- month.abb
+peak_month <- which.max(forecast_2024)
+low_month <- which.min(forecast_2024)
+
+cat("Seasonal patterns:\n")
+cat("Peak month:", monthly_names[peak_month], "with", round(forecast_2024[peak_month], 0), "k guests\n")
+cat("Low month:", monthly_names[low_month], "with", round(forecast_2024[low_month], 0), "k guests\n")
+```
+
+## Uncertainy analysis
+
+```{r}
+width_80_2024 <- upper_80_2024 - lower_80_2024
+width_95_2024 <- upper_95_2024 - lower_95_2024
+
+cat("Prediction interval analysis (2024):\n")
+cat("Average 80% interval width:", round(mean(width_80_2024), 0), "thousand guests\n")
+cat("Average 95% interval width:", round(mean(width_95_2024), 0), "thousand guests\n")
+cat("Relative uncertainty (80%):", round(mean(width_80_2024)/mean(forecast_2024) * 100, 1), "% of forecast\n")
+cat("Relative uncertainty (95%):", round(mean(width_95_2024)/mean(forecast_2024) * 100, 1), "% of forecast\n")
+
+# Uncertainty growth over time
+width_95_36m <- as.numeric(forecast_36m$upper[, 2] - forecast_36m$lower[, 2])
+cat("Uncertainty growth:\n")
+cat("Month 12 (95% width):", round(width_95_2024[12], 0), "thousand guests\n")
+cat("Month 24 (95% width):", round(width_95_36m[24], 0), "thousand guests\n")
+cat("Month 36 (95% width):", round(width_95_36m[36], 0), "thousand guests\n")
+```
+
+## Scenario analysis
+
+```{r}
+scenario_conservative <- lower_80_2024
+scenario_expected <- forecast_2024
+scenario_optimistic <- upper_80_2024
+
+cat("2024 scenarios (annual totals):\n")
+cat("Conservative (80% lower):", round(sum(scenario_conservative), 0), "thousand guests\n")
+cat("Expected (point forecast):", round(sum(scenario_expected), 0), "thousand guests\n")
+cat("Optimistic (80% upper):", round(sum(scenario_optimistic), 0), "thousand guests\n")
+
+# Calculate growth rates for scenarios
+baseline_2023 <- sum(historical_2023)
+cat("Growth vs 2023:\n")
+cat("Conservative scenario:", round((sum(scenario_conservative)/baseline_2023 - 1) * 100, 1), "%\n")
+cat("Expected scenario:", round((sum(scenario_expected)/baseline_2023 - 1) * 100, 1), "%\n")
+cat("Optimistic scenario:", round((sum(scenario_optimistic)/baseline_2023 - 1) * 100, 1), "%\n")
+```
+
+## Comprehensive visualization
+
+```{r}
+par(mfrow = c(2, 2))
+
+# Long-term forecast (3 years)
+plot(ts_data,
+     xlim = c(2017, 2027),
+     ylim = c(0, max(c(ts_data, forecast_36m$upper[, 2])) * 1.1),
+     main = "Portuguese Tourism: SARIMA Forecasts (2024-2026)",
+     ylab = "Monthly Guests (thousands)",
+     xlab = "Year",
+     col = "blue",
+     lwd = 2)
+
+# Add forecasts
+lines(forecast_36m$mean, col = "red", lwd = 2)
+lines(forecast_36m$lower[, 1], col = "orange", lty = 2)
+lines(forecast_36m$upper[, 1], col = "orange", lty = 2)
+lines(forecast_36m$lower[, 2], col = "red", lty = 2)
+lines(forecast_36m$upper[, 2], col = "red", lty = 2)
+
+# Add vertical line at forecast start
+abline(v = 2024, col = "gray", lty = 3, lwd = 2)
+
+legend("topleft", 
+       c("Historical", "Forecast", "80% CI", "95% CI"),
+       col = c("blue", "red", "orange", "red"),
+       lty = c(1, 1, 2, 2),
+       lwd = c(2, 2, 1, 1))
+
+# 2024 monthly forecast detail
+months_2024 <- 1:12
+plot(months_2024, forecast_2024,
+     type = "b",
+     main = "2024 Monthly Forecasts",
+     xlab = "Month",
+     ylab = "Guests (thousands)",
+     pch = 16,
+     col = "red",
+     lwd = 2,
+     xaxt = "n")
+
+# Add confidence bands
+polygon(c(months_2024, rev(months_2024)),
+         c(lower_95_2024, rev(upper_95_2024)),
+         col = rgb(1, 0, 0, 0.2),
+         border = NA)
+
+polygon(c(months_2024, rev(months_2024)),
+         c(lower_80_2024, rev(upper_80_2024)),
+         col = rgb(1, 0, 0, 0.3),
+         border = NA)
+
+lines(months_2024, forecast_2024, col = "red", lwd = 2)
+points(months_2024, forecast_2024, pch = 16, col = "red")
+
+axis(1, at = months_2024, labels = month.abb)
+
+# Seasonal comparison
+historical_seasonal <- apply(matrix(ts_data, ncol = 12, byrow = TRUE), 2, mean)
+forecast_seasonal <- forecast_2024
+
+plot(1:12, historical_seasonal,
+     type = "b",
+     main = "Seasonal Pattern: Historical vs Forecast",
+     xlab = "Month", 
+     ylab = "Guests (thousands)",
+     pch = 16,
+     col = "blue",
+     lwd = 2,
+     xaxt = "n")
+
+lines(1:12, forecast_seasonal, type = "b", pch = 16, col = "red", lwd = 2)
+
+axis(1, at = 1:12, labels = month.abb)
+legend("topleft", c("Historical Average", "2024 Forecast"), 
+       col = c("blue", "red"), lwd = 2, pch = 16)
+
+# Forecast scenarios
+plot(months_2024, scenario_expected,
+     type = "b",
+     main = "2024 Forecast Scenarios",
+     xlab = "Month",
+     ylab = "Guests (thousands)",
+     pch = 16,
+     col = "black",
+     lwd = 2,
+     xaxt = "n",
+     ylim = range(c(scenario_conservative, scenario_optimistic)))
+
+lines(months_2024, scenario_conservative, type = "b", pch = 16, col = "red", lwd = 2)
+lines(months_2024, scenario_optimistic, type = "b", pch = 16, col = "green", lwd = 2)
+
+axis(1, at = months_2024, labels = month.abb)
+legend("topleft", 
+       c("Expected", "Conservative", "Optimistic"),
+       col = c("black", "red", "green"),
+       lwd = 2, pch = 16)
+```
+
+## Save results
+
+```{r}
+forecast_2024_df <- data.frame(
+  Month = month.abb,
+  Month_Num = 1:12,
+  Point_Forecast = round(forecast_2024, 0),
+  Lower_80 = round(lower_80_2024, 0),
+  Upper_80 = round(upper_80_2024, 0),
+  Lower_95 = round(lower_95_2024, 0),
+  Upper_95 = round(upper_95_2024, 0),
+  Conservative = round(scenario_conservative, 0),
+  Optimistic = round(scenario_optimistic, 0)
+)
+forecast_2024_df
+```
+
+### Add annual summary
+
+```{r}
+annual_summary <- data.frame(
+  Metric = c("Point Forecast", "Conservative (80% Lower)", "Optimistic (80% Upper)",
+             "95% Lower Bound", "95% Upper Bound"),
+  Annual_Total = c(sum(forecast_2024), sum(scenario_conservative), sum(scenario_optimistic),
+                   sum(lower_95_2024), sum(upper_95_2024)),
+  Growth_vs_2023 = c(
+    (sum(forecast_2024)/baseline_2023 - 1) * 100,
+    (sum(scenario_conservative)/baseline_2023 - 1) * 100,
+    (sum(scenario_optimistic)/baseline_2023 - 1) * 100,
+    (sum(lower_95_2024)/baseline_2023 - 1) * 100,
+    (sum(upper_95_2024)/baseline_2023 - 1) * 100
+  )
+)
+annual_summary
+```
+
+### Save results
+
+```{r}
+write.csv(forecast_2024_df, "analysis/forecast_2024_monthly.csv", row.names = FALSE)
+write.csv(annual_summary, "analysis/forecast_2024_annual.csv", row.names = FALSE)
+```
+
+# Conclusions
+
+This project successfully applied advanced time series modeling techniques to forecast monthly tourism demand in Portugal. After thorough data cleaning, exploratory analysis, and transformation, the seasonal patterns and non-stationary behavior of the series were confirmed and properly addressed.
+
+A wide range of SARIMA models were evaluated through both manual grid search and automatic procedures. The best-performing model—SARIMA(1,0,1)(1,1,0)[12]—was selected based on a combination of AICc, residual diagnostics, and parameter significance. Residuals exhibited independence and homoskedasticity, supporting model validity.
+
+Out-of-sample forecasts for 2022–2023 revealed that while the SARIMA model had excellent structural diagnostics, the ETS model outperformed it in terms of RMSE and MAPE. However, given the SARIMA model’s interpretability and robustness, it was retained for future projections.
+
+Forecasts for 2024 indicate moderate growth (+4.4%) over 2023, with a projected annual total of 33.9 million guests. The model captures strong seasonality, with expected peaks in August and lows in January. Confidence intervals and scenario analysis underscore the high uncertainty associated with long-term forecasts, especially beyond one year.
+
+The project demonstrates that classical time series methods, when rigorously applied, can yield reliable insights and actionable forecasts in the tourism domain.
+
+## References
+
+-   Shumway, R.H., & Stoffer, D.S. (2011). Time Series Analysis and Its Applications: With R Examples (3rd ed.). Springer. – A comprehensive text covering ARIMA, state-space models, and R-based implementation, suitable for academic and applied contexts.
+
+-   Cryer, J.D., & Chan, K.-S. (2008). Time Series Analysis: With Applications in R (2nd ed.). Springer. – Well-suited for ARIMA and forecasting techniques with practical R applications, especially useful for Box & Jenkins methodology and forecast accuracy metrics.
+
+-   R Package Documentation
